@@ -12,7 +12,6 @@ import NodeKey from './nodekey/NodeKey';
 import Service from './service/Service';
 import { EventEmitter } from 'events';
 import Swaps from './swaps/Swaps';
-import path from 'path';
 
 const version: string = require('../package.json').version;
 

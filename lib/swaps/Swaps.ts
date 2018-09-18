@@ -1,4 +1,4 @@
-import { SwapDealRole, SwapDealState, SwapDealPhase } from '../types/enums';
+import { SwapDealRole, SwapDealState, SwapDealPhase, SwapRejectionReason } from '../types/enums';
 import Peer from '../p2p/Peer';
 import * as packets from '../p2p/packets/types';
 import { createHash, randomBytes } from 'crypto';
@@ -15,9 +15,9 @@ type SwapDeal = {
   myRole: SwapDealRole;
   /** The most updated deal phase */
   phase: SwapDealPhase;
-  /** The most updated deal state. State works
-   * together with the phase to indicates the phase of the deal in it's
-   * life cycle and if the deal is active, errored or completed.
+  /**
+   * The most updated deal state. State works together with phase to indicate where the
+   * deal is in its life cycle and if the deal is active, errored, or completed.
    */
   state: SwapDealState;
   /** The reason for being in current state */
@@ -25,7 +25,6 @@ type SwapDeal = {
   /** Global order id in the XU network. */
   orderId: string;
   /** The quantity of the order to execute as proposed by the taker. Negative when the taker is selling. */
-  // TODO: is it needed here? if yes, should be in satoshis
   proposedQuantity: number;
   /** The accepted quantity of the order to execute as accepted by the maker. Negative when the taker is selling. */
   quantity?: number;
@@ -41,6 +40,8 @@ type SwapDeal = {
   makerAmount: number;
   /** The currency the maker is expecting to receive. */
   makerCurrency: string;
+  /** The price of the order that's being executed. */
+  price: number;
   /** The hash of the preimage. */
   r_hash: string;
   r_preimage?: string;
@@ -50,13 +51,8 @@ type SwapDeal = {
 };
 
 interface Swaps {
-  // TODO: put swap.rejected and swap.accepted to work or delete them.
-  on(event: 'swap.rejected', listener: (deal: SwapDeal) => void): this;
-  on(event: 'swap.accepted', listener: (deal: SwapDeal, quantity: number) => void): this;
   on(event: 'swap.paid', listener: (deal: SwapDeal) => void): this;
   on(event: 'swap.failed', listener: (deal: SwapDeal) => void): this;
-  emit(event: 'swap.rejected', deal: SwapDeal): boolean;
-  emit(event: 'swap.accepted', deal: SwapDeal, quantity: number): boolean;
   emit(event: 'swap.paid', deal: SwapDeal): boolean;
   emit(event: 'swap.failed', deal: SwapDeal): boolean;
 }
@@ -76,7 +72,7 @@ class Swaps extends EventEmitter {
    * @param quantity the quantity of the taker's order
    * @param price the price specified by the maker order being filled
    */
-  private static calculateSwapAmounts = (quantity: number, price: number) => {
+  public static calculateSwapAmounts = (quantity: number, price: number) => {
     let takerAmount: number;
     let makerAmount: number;
     // TODO: use configurable amount of subunits/satoshis per token for each currency
@@ -94,7 +90,6 @@ class Swaps extends EventEmitter {
   }
 
   private bind() {
-    this.pool.on('packet.swapRequest', this.handleSwapRequest);
     this.pool.on('packet.swapResponse', this.handleSwapResponse);
     this.pool.on('packet.swapComplete', this.handleSwapComplete);
     this.pool.on('packet.swapError', this.handleSwapError);
@@ -129,8 +124,6 @@ class Swaps extends EventEmitter {
 
     // TODO: check lndPubKeys. Error if we or maker do not have full set of keys
     // TODO: check route to peer. Maybe there is no route or no capacity to send the amount
-    // TODO: what is the status of the order here? is it off the book? What if partial match
-    //       do we create another order which has the same orderId?
     // TODO: check that pairID is LTC/BTC or handleSwapResponse fails
 
     const [baseCurrency, quoteCurrency] = maker.pairId.split('/');
@@ -152,8 +145,6 @@ class Swaps extends EventEmitter {
     const swapRequestBody: packets.SwapRequestPacketBody = {
       takerCurrency,
       makerCurrency,
-      takerAmount,
-      makerAmount,
       r_hash: createHash('sha256').update(preimage).digest('hex'),
       orderId: maker.id,
       pairId: maker.pairId,
@@ -162,6 +153,9 @@ class Swaps extends EventEmitter {
 
     const deal: SwapDeal = {
       ...swapRequestBody,
+      takerAmount,
+      makerAmount,
+      price: maker.price,
       phase: SwapDealPhase.SwapCreated,
       state: SwapDealState.Active,
       stateReason: '',
@@ -179,41 +173,44 @@ class Swaps extends EventEmitter {
   }
 
   /**
-   * Handles a request from a peer to create a swap deal. Creates a deal,
-   * and stores the deal in the local collection of deals. Responds to the peer with a swap response packet.
+   * Checks if a payment route exists for a specified node and network.
    */
-  private handleSwapRequest = (requestPacket: packets.SwapRequestPacket, peer: Peer)  => {
-    assert(requestPacket.body, 'SwapRequestPacket does not contain a body');
-    const requestBody = requestPacket.body!;
+  private checkIfRouteExists = async (_destPubKey: string, _amount: number, _currency: string) => {
+    // TODO: implement
+    return true;
+  }
 
-    // TODO: we always accept proposed quantity currently, put in checks to make sure we have the full amount available
-    // TODO: consider reduced quantity
-    // TODO: check that the order is still valid and take it off the order book to prevent double execution
-    // TODO: check that we have route to taker.
+  /**
+   * Accepts a proposed deal for a specified amount and price *if and only if* a route exists to
+   * pay the taker. Stores payable deal in the local collection of deals.
+   * @returns true if a route exists to pay taker and the deal is stored, false otherwise
+   */
+  public acceptDeal = async (acceptedQuantity: number, price: number, requestBody: packets.SwapRequestPacketBody, peer: Peer) => {
     // TODO: extract data needed for proper timelock calculation and share with taker
+    const { takerAmount, makerAmount } = Swaps.calculateSwapAmounts(acceptedQuantity, price);
+    const takerPubKey = peer.getLndPubKey(requestBody.takerCurrency)!;
 
-    // accept the deal
-    const deal: SwapDeal = {
-      ...requestBody,
-      quantity: requestBody.proposedQuantity,
-      phase: SwapDealPhase.SwapCreated,
-      state: SwapDealState.Active,
-      stateReason: '',
-      takerPubKey: peer.getLndPubKey(requestBody.takerCurrency),
-      r_hash: requestBody.r_hash,
-      myRole: SwapDealRole.Maker,
-      createTime: Date.now(),
-    };
+    // check that a route exists to pay our part of the swap
+    const hasRoute = await this.checkIfRouteExists(takerPubKey, takerAmount, requestBody.takerCurrency);
+    if (hasRoute) {
+      const deal: SwapDeal = {
+        ...requestBody,
+        takerPubKey,
+        takerAmount,
+        makerAmount,
+        price,
+        quantity: acceptedQuantity,
+        phase: SwapDealPhase.SwapCreated,
+        state: SwapDealState.Active,
+        stateReason: '',
+        myRole: SwapDealRole.Maker,
+        createTime: Date.now(),
+      };
 
-    this.addDeal(deal);
-
-    const responseBody: packets.SwapResponsePacketBody = {
-      r_hash: requestBody.r_hash,
-      quantity: requestBody.proposedQuantity,
-    };
-
-    peer.sendPacket(new packets.SwapResponsePacket(responseBody, requestPacket.header.id));
-    this.setDealPhase(deal, SwapDealPhase.SwapAgreed);
+      this.addDeal(deal);
+      this.setDealPhase(deal, SwapDealPhase.SwapAgreed);
+    }
+    return hasRoute;
   }
 
   /**
@@ -222,19 +219,29 @@ class Swaps extends EventEmitter {
    */
   private handleSwapResponse = async (responsePacket: packets.SwapResponsePacket, peer: Peer) => {
     assert(responsePacket.body, 'SwapResponsePacket does not contain a body');
-    const { quantity, r_hash } = responsePacket.body!;
+    const { quantity, r_hash, rejectionReason } = responsePacket.body!;
     const deal = this.getDeal(r_hash);
     if (!deal) {
       this.logger.error(`received swap response for unrecognized deal r_hash ${r_hash}`);
       return;
     }
 
+    if (rejectionReason) {
+      this.setDealState(deal, SwapDealState.Error, SwapRejectionReason[rejectionReason]);
+      return;
+    }
+
     if (quantity) {
-      // TODO: require a non-zero quantity value on accepted swap responses
-      if (quantity > deal.proposedQuantity) {
-        // TODO: this should not happen, abort deal and penalize peer
+      deal.quantity = quantity; // set the accepted quantity for the deal
+      if (quantity <= 0) {
+        // TODO: accepted quantity must be a positive number, abort deal and penalize peer
+      } else if (quantity > deal.proposedQuantity) {
+        // TODO: accepted quantity should not be greater than proposed quantity, abort deal and penalize peer
       } else if (quantity < deal.proposedQuantity) {
-        // TODO: the maker accepted only part of our swap request, adjust the deal amounts with Swaps.calculateSwapAmounts
+        // the maker accepted only part of our swap request, adjust the deal amounts
+        const { takerAmount, makerAmount } = Swaps.calculateSwapAmounts(quantity, deal.price);
+        deal.takerAmount = takerAmount;
+        deal.makerAmount = makerAmount;
       }
     }
 
