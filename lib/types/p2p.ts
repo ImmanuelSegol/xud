@@ -21,6 +21,14 @@ export type HandshakeState = {
   lndltcPubKey?: string;
 };
 
+export type HandshakeStateUpdate = {
+  addresses?: Address[];
+  pairs?: string[];
+  raidenAddress?: string;
+  lndbtcPubKey?: string;
+  lndltcPubKey?: string;
+};
+
 export function isHandshakeState(obj: any): obj is HandshakeState {
   return obj && typeof obj.version === 'string' && typeof obj.nodePubKey === 'string' && Array.isArray(obj.addresses)
     && Array.isArray(obj.pairs);
